@@ -14,6 +14,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.function.BiFunction;
@@ -60,19 +61,37 @@ public class DataFixerBuilder {
 
     public DataFixer build(final Executor executor) {
         final DataFixerUpper fixerUpper = new DataFixerUpper(new Int2ObjectAVLTreeMap<>(schemas), new ArrayList<>(globalList), new IntAVLTreeSet(fixerVersions));
+        final List<Runnable> allTasks = new ArrayList<>();
 
         final IntBidirectionalIterator iterator = fixerUpper.fixerVersions().iterator();
         while (iterator.hasNext()) {
             final int versionKey = iterator.nextInt();
             final Schema schema = schemas.get(versionKey);
-            for (final String typeName : schema.types()) {
-                executor.execute(() -> {
+            for (final String typeName: schema.types()) {
+                allTasks.add(() -> {
                     final Type<?> dataType = schema.getType(() -> typeName);
                     final TypeRewriteRule rule = fixerUpper.getRule(DataFixUtils.getVersion(versionKey), dataVersion);
                     dataType.rewrite(rule, DataFixerUpper.OPTIMIZATION_RULE);
                 });
             }
         }
+
+        // Divide up into sets of tasks by number of CPU cores
+        // Some tasks are faster than others, randomize it to try to divide it more
+        final List<List<Runnable>> queueList = new ArrayList<>();
+        // reduce by 2 cores to allow 1 for game, 1 for OS, and overall 6 cap
+        final int maxTasks = (int) Math.max(1, Math.floor(allTasks.size() / (float)Math.min(6, Runtime.getRuntime().availableProcessors()-2)));
+        Collections.shuffle(allTasks);
+        List<Runnable> current = new ArrayList<>();
+        queueList.add(current);
+        for (final Runnable task: allTasks) {
+            if (current.size() >= maxTasks) {
+                current = new ArrayList<>();
+                queueList.add(current);
+            }
+            current.add(task);
+        }
+        queueList.forEach(queue -> executor.execute(() -> queue.forEach(Runnable::run)));
 
         return fixerUpper;
     }
